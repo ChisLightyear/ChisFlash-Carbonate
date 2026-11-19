@@ -9,7 +9,7 @@ ChisFlash 碳酸钙 GB／GBC／GBA 卡带烧录器固件源码与发布文件。
 - 固件：改版板 `RC39-JRBASE`／原版板 `RC39-O-JRBASE`。
 - 本仓库最后附带的插件：`0.3.3`，对应官方 FlashGBX `5.2.1`。
 - USB：`0483:0721`，产品名 `ChisFlash Carbonate`／`ChisFlash Carbonate Original`，协议身份 C15。
-- [下载 RC39 固件及本次最后附带的插件](https://github.com/moribaka/ChisFlash-Carbonate/releases/tag/RC39)。
+- [下载 RC39 固件及本次最后附带的插件](https://github.com/ChisLightyear/ChisFlash-Carbonate/releases/tag/RC39)。
 - [之后的插件更新：FlashGBX Rescue](https://github.com/ChisLightyear/flashgbx-rescue)。
 
 | 板型 | 固件文件 |
