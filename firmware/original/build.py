@@ -94,8 +94,6 @@ for name in SOURCES:
     if obj.exists():
         obj.unlink()
     segment_flags = ['--codeseg', 'FAST_CODE'] if name in ('lk_special_hal','board') else []
-    # 通用协议解释器优先控制体积；总线内核仍保留原有速度优化。
-    if name == 'flashgbx': segment_flags += ['--opt-code-size']
     run(common + segment_flags + ['-c', 'src/' + name + '.c', '-o', str(obj)])
     assert obj.exists() and obj.stat().st_size > 0
     objects.append(str(obj))

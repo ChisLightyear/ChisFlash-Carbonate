@@ -4,8 +4,8 @@
 
 | 目录 | 板型 | HEX 变体名 | 身份串 |
 | --- | --- | --- | --- |
-| `modified/` | 改版 PCB（总线修复版） | `pcb_bus_flashgbx_20261028` | `ChisFlash FW C15 RC33-NATIVE` |
-| `original/` | 原版 PCB | `original_flashgbx_rc32` | `ChisFlash Original FW C15 RC33-O-NATIVE` |
+| `modified/` | 改版 PCB（总线修复版） | `pcb_bus_flashgbx_20261028` | `ChisFlash FW C15 RC39-JRBASE` |
+| `original/` | 原版 PCB | `original_flashgbx_rc32` | `ChisFlash Original FW C15 RC39-O-JRBASE` |
 
 两套源码的硬件映射不同，**不能混刷**。USB 身份为 `0483:0721`，产品名分别是 `ChisFlash Carbonate` 与 `ChisFlash Carbonate Original`。
 

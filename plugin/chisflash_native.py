@@ -1,6 +1,10 @@
 """FlashGBX 5.2.1 的 ChisFlash 独立后端与盖中盖原生后端。"""
 import copy
+import configparser
 import json
+import math
+import os
+from pathlib import Path
 import datetime
 import re
 import struct
@@ -12,15 +16,17 @@ import zlib
 
 import serial
 import serial.tools.list_ports
-from FlashGBX.app import HW_DEVICES
+from FlashGBX.app import AppContext, HW_DEVICES
+from FlashGBX.hw_GBFlash import GbxDevice as _GBFlashBase
 from FlashGBX.hw_JoeyJr import GbxDevice as _DeviceBase
-from FlashGBX.LK_Device import LK_Device
+from FlashGBX.LK_Device import LK_Device, ANSI, dprint
+from FlashGBX.i18n import __
 from FlashGBX.RomFileAGB import RomFileAGB
 from FlashGBX.RomFileDMG import RomFileDMG
 
-PLUGIN_NAME = "ChisFlash 碳酸钙与盖中盖"
-PLUGIN_VERSION = "0.2.1"
-PLUGIN_DESCRIPTION = "碳酸钙独立身份及完整兼容指令后端；盖中盖基础原生后端。"
+PLUGIN_NAME = "GBFlash 与 ChisFlash 碳酸钙及盖中盖"
+PLUGIN_VERSION = "0.3.3"
+PLUGIN_DESCRIPTION = "沿用 GBFlash/JR 后端及上电 500 ms；盖中盖使用原生事务，不追加写后读回。"
 IDENTITY_REQUEST = b'\x55\xaa'
 CARBONATE_PRODUCTS = ('ChisFlash Carbonate', 'ChisFlash Carbonate Original')
 
@@ -123,8 +129,48 @@ def _identify_chisflash(raw):
             'protocol': int(match[2]), 'version': match[3].decode('ascii')}
 
 
-class CarbonateDevice(LK_Device):
-    """直接复用官方通用 worker 和协议传输，不依赖 Joey 设备身份。"""
+def _power_on_delay_seconds():
+    """两个可控供电后端共用设置；缺省为本轮实测通过的额外 500 ms。"""
+    settings = configparser.ConfigParser(interpolation=None)
+    try:
+        settings.read(Path(AppContext.CONFIG_PATH) / 'settings.ini', encoding='utf-8-sig')
+        milliseconds = settings.getfloat('General', 'ChisFlashPowerOnDelayMs', fallback=500)
+        if not math.isfinite(milliseconds) or not 0 <= milliseconds <= 10000:
+            return 0.5
+        return milliseconds / 1000
+    except (OSError, ValueError, configparser.Error, TypeError):
+        return 0.5
+
+
+class _PowerOnDelayMixin:
+    """仅在真正发送上电命令后等待，不改变卡带事务或增加读回。"""
+    def CartPowerOn(self):
+        previous = getattr(self, '_power_on_delay_context', False)
+        self._power_on_delay_context = True
+        try:
+            return super().CartPowerOn()
+        finally:
+            self._power_on_delay_context = previous
+
+    def _write(self, data, wait=False):
+        if not getattr(self, '_power_on_delay_context', False):
+            return super()._write(data, wait=wait)
+        command = bytes([data]) if isinstance(data, int) else bytes(data)
+        if command != bytes([self.DEVICE_CMD['CART_PWR_ON']]):
+            return super()._write(data, wait=wait)
+        result = super()._write(data, wait=wait)
+        if result is not False:
+            time.sleep(_power_on_delay_seconds())
+        return result
+
+
+class GBFlashDevice(_PowerOnDelayMixin, _GBFlashBase):
+    """保留官方 GBFlash 识别与读写，仅追加上电等待。"""
+    pass
+
+
+class CarbonateDevice(_PowerOnDelayMixin, _DeviceBase):
+    """沿用官方 JR 后端，仅适配碳酸钙本名身份与硬件能力。"""
     DEVICE_NAME = 'ChisFlash（碳酸钙）'
     DEVICE_LABEL_LONG = DEVICE_NAME
     DEVICE_LABEL_SHORT = '碳酸钙'
@@ -149,32 +195,106 @@ class CarbonateDevice(LK_Device):
         products = _usb_products()
         return [port for port in super().GetCandidatePorts(comports) if products.get(port) in CARBONATE_PRODUCTS]
 
+    def TryConnect(self, port, baudrate, keep_open=False):
+        if _usb_products().get(port) not in CARBONATE_PRODUCTS:
+            return False
+        return super().TryConnect(port, baudrate, keep_open=keep_open)
+
     def Initialize(self, flashcarts, port=None, max_baud=2000000):
-        self.Close()
-        for candidate in ([port] if port else self.GetCandidatePorts()):
-            if _usb_products().get(candidate) not in CARBONATE_PRODUCTS:
+        if self.DEVICE is not None: self.DEVICE.close()
+        self.DEVICE = None
+        self.FW = None
+        conn_msg = []
+        ports = []
+        if port is not None:
+            ports = [ port ]
+        else:
+            ports = self.GetCandidatePorts()
+            if len(ports) == 0: return False
+
+        for i in range(0, len(ports)):
+            if self.TryConnect(ports[i], max_baud, keep_open=True):
+                self.BAUDRATE = max_baud
+                dev = self.DEVICE
+            else:
                 continue
-            raw = None
+
+            if self.FW is None or self.FW == {}: continue
+
+            dprint(f"Found a {self.DEVICE_NAME}")
+            dprint("Firmware information:", self.FW)
+
+            if self.DEVICE is None or not self.IsConnected():
+                dev.close()
+                self.DEVICE = None
+                if self.FW is not None:
+                    conn_msg.append([0, __("Couldn’t communicate with the {device_name} on port {port}. Please disconnect and reconnect the device, then try again.", device_name=self.DEVICE_NAME, port=ports[i])])
+                continue
+            elif self.FW is None:
+                dev.close()
+                self.DEVICE = None
+                continue
+            elif self.FW["cfw_id"] == "G":  # 沿用 JR 对其他固件家族的分支。
+                dprint("Device runs the JoeyGUI firmware")
+            elif self.FW["pcb_ver"] not in self.PCB_VERSIONS.keys() or "cfw_id" not in self.FW or self.FW["cfw_id"] != 'C' or self.FW["fw_ver"] < self.DEVICE_MIN_FW:  # 只将 JR 的 L 家族识别改为碳酸钙 C 家族。
+                dprint("Incompatible firmware:", self.FW)
+                dev.close()
+                self.DEVICE = None
+                continue
+            elif self.FW["fw_ts"] > self.DEVICE_LATEST_FW_TS:
+                conn_msg.append([1, __("Note: The {device_name} on port {port} is running a firmware version that is newer than what this version of FlashGBX was developed to work with, so errors may occur.", device_name=self.DEVICE_NAME, port=ports[i])])
+
+            if (self.FW["pcb_ver"] & 0x7F) == 1:
+                conn_msg.append([2, __("Warning: Your {device_name} does not support the software-controlled voltage setting feature, so please be extra careful and always set the switch to the correct voltage before inserting a cartridge.", device_name=self.DEVICE_NAME)])
+
+            self.PORT = ports[i]
+            self.DEVICE.timeout = self.DEVICE_TIMEOUT
+
+            # 沿用 JR 的卡带配置加载。
+            self.UpdateFlashCarts(flashcarts)
+
+            # 找到第一个设备后结束扫描。
+            break
+
+        return conn_msg
+
+    def CheckActive(self):
+        if self.LAST_CHECK_ACTIVE and time.monotonic() < self.LAST_CHECK_ACTIVE + 1: return True
+        dprint("Checking if device is active")
+        if self.DEVICE is None: return False
+        if self.FW["pcb_name"] is None:
+            if self.LoadFirmwareVersion():
+                self.LAST_CHECK_ACTIVE = time.monotonic()
+                return True
+            else:
+                return False
+        try:
+            if self.FW.get("cfw_id") == "C" and self.FW.get("fw_ver", 0) >= 15:
+                challenge = os.urandom(1)[0]
+                self._write(bytearray([self.DEVICE_CMD["PING"], challenge]))
+                response = self._read(1)
+                if response is False or response != ((~challenge) & 0xFF):
+                    raise ConnectionError("Invalid firmware response (ping response was {response} instead of {expected})".format(response=str(response), expected=str((~challenge) & 0xFF)))
+            else:
+                modes = self.GetSupportedModes()
+                mode = self._get_fw_variable("CART_MODE")
+                if mode > len(modes):
+                    raise ConnectionError("Invalid firmware response (mode={mode})".format(mode=str(mode - 1)))
+            self.LAST_CHECK_ACTIVE = time.monotonic()
+            return True
+        except Exception as e:
+            if self.USER_ANSWER is not True:  # 沿用 CartPowerCycleOrAskReconnect() 的处理。
+                print(ANSI.RED + __("Disconnecting from the device, because a critical error occurred!\n{error}", error=str(e)) + ANSI.RESET)
+                dprint(__("Disconnecting from the device, because a critical error occurred!\n{error}", error=str(e)))
             try:
-                raw = self._OpenSerial(candidate, baudrate=9600, timeout=0.05, write_timeout=5)
-                _prepare_serial(raw)
-                identity = _identify_chisflash(raw)
-                if identity is None:
-                    raw.close()
-                    continue
-                self.DEVICE, self.PORT, self.IDENTITY = raw, candidate, identity
-                self.BAUDRATE = 9600
-                raw.timeout = self.DEVICE_TIMEOUT
-                if not self.LoadFirmwareVersion():
-                    raise IOError('碳酸钙固件信息与原生身份不一致')
-                self.UpdateFlashCarts(flashcarts)
-                return []
-            except (OSError, serial.SerialException, ValueError, struct.error) as error:
-                if raw is not None:
-                    raw.close()
-                self.DEVICE, self.FW, self.IDENTITY = None, {}, None
-                self.ERROR_ARGS['connection'] = str(error)
-        return False
+                if self.DEVICE.isOpen():
+                    self.DEVICE.reset_input_buffer()
+                    self.DEVICE.reset_output_buffer()
+                    self.DEVICE.close()
+                self.DEVICE = None
+            except:
+                pass
+            return False
 
     def _exact_info(self, count):
         data = bytearray()
@@ -186,39 +306,66 @@ class CarbonateDevice(LK_Device):
         return bytes(data)
 
     def LoadFirmwareVersion(self):
-        if self.IDENTITY is None or self.DEVICE is None:
+        try:
+            if self.DEVICE is None:
+                return False
+            self.DEVICE.timeout = 0.075
+            self.DEVICE.reset_input_buffer()
+            self.DEVICE.reset_output_buffer()
+            self.IDENTITY = _identify_chisflash(self.DEVICE)
+            if self.IDENTITY is None:
+                return False
+            self.DEVICE.timeout = self.DEVICE_TIMEOUT
+            self._write(self.DEVICE_CMD['QUERY_FW_INFO'])
+            if self._exact_info(1) != b'\x08':
+                return False
+            family, protocol, pcb, timestamp = struct.unpack('>cHBI', self._exact_info(8))
+            if family != b'C' or protocol != self.IDENTITY['protocol']:
+                return False
+            length = self._exact_info(1)[0]
+            name = self._exact_info(length).decode('ascii')
+            expected_name = 'ChisFlash Original' if self.IDENTITY['board'] == 'original' else 'ChisFlash'
+            if name != expected_name:
+                return False
+            power, boot = self._exact_info(2)
+            self.FW = {'cfw_id': 'C', 'fw_ver': protocol, 'pcb_ver': pcb,
+                       'fw_ts': timestamp, 'fw_dt': datetime.datetime.fromtimestamp(timestamp).astimezone().isoformat(),
+                       'pcb_name': name, 'ofw_ver': None, 'device_serial': None,
+                       'cart_power_ctrl': bool(power & 1), 'cart_presence_switch': bool(power & 2),
+                       'cart_mode_switch': bool(power & 4), 'bootloader_reset': bool(boot & 1)}
+            return True
+        except Exception as e:
+            dprint("Disconnecting due to an error", e, sep="\n")
+            try:
+                if self.DEVICE.isOpen():
+                    self.DEVICE.reset_input_buffer()
+                    self.DEVICE.reset_output_buffer()
+                    self.DEVICE.close()
+                self.DEVICE = None
+            except:
+                pass
             return False
-        self._write(self.DEVICE_CMD['QUERY_FW_INFO'])
-        if self._exact_info(1) != b'\x08':
-            return False
-        family, protocol, pcb, timestamp = struct.unpack('>cHBI', self._exact_info(8))
-        if family != b'C' or protocol != self.IDENTITY['protocol']:
-            return False
-        length = self._exact_info(1)[0]
-        name = self._exact_info(length).decode('ascii')
-        expected_name = 'ChisFlash Original' if self.IDENTITY['board'] == 'original' else 'ChisFlash'
-        if name != expected_name:
-            return False
-        power, boot = self._exact_info(2)
-        self.FW = {'cfw_id': 'C', 'fw_ver': protocol, 'pcb_ver': pcb,
-                   'fw_ts': timestamp, 'fw_dt': datetime.datetime.fromtimestamp(timestamp).astimezone().isoformat(),
-                   'pcb_name': name, 'ofw_ver': None, 'device_serial': None,
-                   'cart_power_ctrl': bool(power & 1), 'cart_presence_switch': bool(power & 2),
-                   'cart_mode_switch': bool(power & 4), 'bootloader_reset': bool(boot & 1)}
-        return True
 
     def Close(self, cartPowerOff=False):
-        raw = self.DEVICE
-        if raw is None:
+        if self.DEVICE is None:
             return
-        try:
-            if cartPowerOff and raw.is_open and self.CanPowerCycleCart():
-                self._set_fw_variable('AUTO_POWEROFF_TIME', 0)
-                self._write(self.DEVICE_CMD['CART_PWR_OFF'], wait=True)
-        finally:
-            raw.close()
-            self.DEVICE, self.MODE = None, None
-            self.LAST_CHECK_ACTIVE = 0
+        return super().Close(cartPowerOff=cartPowerOff)
+
+    def DetectFlash(self, limitVoltage=False):
+        """用既有扩展 ID 命中和 CFI 结果区分 02G，不追加设备事务。"""
+        result = super().DetectFlash(limitVoltage=limitVoltage)
+        if self.MODE != 'AGB':
+            return result
+        matched, selected, id_text, cfi_text, cfi, detected_size = result
+        carts = list(self.SUPPORTED_CARTS['AGB'].values())
+        s70 = [index for index in matched
+               if carts[index].get('flash_size') == 0x10000000
+               and carts[index].get('flash_bank_select_type') == 1
+               and carts[index].get('flash_id_offsets') == [28, 29, 30, 31]
+               and carts[index].get('flash_ids') == [[0x48, 0x22, 0x01, 0x22]]]
+        if len(s70) == 1 and cfi and cfi.get('device_size') == 0x10000000:
+            return (matched, s70[0], id_text, cfi_text, cfi, 0x10000000)
+        return result
 
     def GetFirmwareVersion(self, more=False):
         version = self.IDENTITY['version'] if self.IDENTITY else '未知'
@@ -252,15 +399,6 @@ class UnsupportedNativeFeature(NotImplementedError):
     pass
 
 
-def crc16(data):
-    value = 0xffff
-    for byte in data:
-        value ^= byte
-        for _ in range(8):
-            value = (value >> 1) ^ (0xa001 if value & 1 else 0)
-    return value
-
-
 class NativeLink:
     """单个请求完整接收响应后才发送下一帧；不把占位响应头当作 CRC 校验。"""
     def __init__(self, port, cancelled=lambda: False):
@@ -279,12 +417,6 @@ class NativeLink:
     def chunk_size(left, overhead, unit=1):
         size = min(left, 4096)
         size -= size % unit
-        # 双协议固件会检查首字节，避开可能被识别为另一协议探测符的帧长度。
-        reserved = {0x44, 0x55, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x4b, 0x4c}
-        while size and (((size + overhead) & 255) >= 0xa0 or ((size + overhead) & 255) in reserved):
-            size -= unit
-        if not size:
-            raise NativeProtocolError('盖中盖载荷长度无法组成有效帧')
         return size
 
     def exact(self, count, timeout):
@@ -302,8 +434,6 @@ class NativeLink:
 
     def request(self, command, body=b'', read_length=None, ack=False, timeout=5):
         with self.lock:
-            if command not in (0xf0, 0xf1, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xea, 0xeb):
-                raise UnsupportedNativeFeature(f'盖中盖原生协议未提供该命令：0x{command:02X}')
             if self.cancelled():
                 raise NativeProtocolError('操作已取消')
             packet = self.frame(command, body)
@@ -314,6 +444,8 @@ class NativeLink:
             self.port.flush()
             if ack:
                 response = self.exact(1, timeout)
+                # 原版单字节 ACK 接收后丢弃残留输入；数据响应不做此处理。
+                self.port.reset_input_buffer()
                 if response != b'\xaa':
                     raise NativeProtocolError(f'盖中盖 ACK 错误：{response.hex()}')
                 return b''
@@ -341,8 +473,8 @@ class NativeLink:
     def write(self, mode, address, data, buffer_size=None):
         data = bytes(data)
         unit = 2 if mode == 'AGB' else 1
-        if len(data) % unit or (mode == 'AGB' and address & 1):
-            raise ValueError('GBA 写入地址和数据必须按 16 位字对齐')
+        if mode == 'AGB' and len(data) & 1:
+            data += b'\x00'  # 沿用原版奇数字节补一个 00。
         offset = 0
         while offset < len(data):
             overhead = 11 if buffer_size is not None else 9
@@ -407,7 +539,6 @@ class GbxDevice(_DeviceBase):
                 _prepare_serial(raw)
                 self.DEVICE, self.PORT = raw, candidate
                 self._native = NativeLink(raw, lambda: self.CANCEL)
-                self._native.read('AGB', 0, 4)
                 self.UpdateFlashCarts(flashcarts)
                 return []
             except (OSError, serial.SerialException, NativeProtocolError) as error:
@@ -485,16 +616,8 @@ class GbxDevice(_DeviceBase):
         if not data:
             return False
         if self.MODE == 'AGB':
-            size = 0x10000
-            if data.get('empty') or data.get('empty_nocart'):
-                size = 0x2000000
-            else:
-                reference = header[0xa0:0xb0]
-                while size < 0x2000000:
-                    if self.ReadROM(size + 0xa0, 16) == reference:
-                        break
-                    size *= 2
-            data['rom_size'] = size
+            # 沿用头解析信息和界面容量选择，不为初始化追加容量读取探针。
+            data.setdefault('rom_size', 0x2000000)
         data.update(raw=header, has_rtc=False, rtc_dict={}, rtc_string='首版插件未读取 RTC',
                     no_rtc_reason='盖中盖 RTC 适配尚未实现')
         self.INFO.update(data)
@@ -520,9 +643,6 @@ class GbxDevice(_DeviceBase):
         with self._lock:
             target = address if self.MODE == 'AGB' else 0xa000 + address
             self._native.write('SRAM' if self.MODE == 'AGB' else 'DMG', target, buffer)
-            actual = self._native.read('SRAM' if self.MODE == 'AGB' else 'DMG', target, len(buffer))
-            if actual != bytes(buffer):
-                raise NativeProtocolError('存档写入后回读不一致')
             self.FW_VAR['ADDRESS'] = target + len(buffer)
             if self.INFO.get('action') == 3 and not self.NO_PROG_UPDATE:
                 self.SetProgress({'action': 'WRITE', 'bytes_added': len(buffer)})
@@ -561,8 +681,8 @@ class GbxDevice(_DeviceBase):
             raise UnsupportedNativeFeature('首版插件尚未实现编程命令期间的特殊换 Bank/复位时序')
         unit = 2 if self.MODE == 'AGB' else 1
         data = bytes(buffer)
-        if len(data) % unit:
-            raise ValueError('编程数据未按总线字宽对齐')
+        if self.MODE == 'AGB' and len(data) & 1:
+            data += b'\x00'
         page = int(flash_buffer_size or 0)
         prefixes = [(a * unit, v) for a, v in self._commands[:3]]
         normal = (prefixes[:2] == [(0xaaa, 0xaa), (0x554 if unit == 2 else 0x555, 0x55)]
@@ -570,36 +690,17 @@ class GbxDevice(_DeviceBase):
                   and (bool(page) or prefixes[2][0] == 0xaaa)
                   and (not page or self._commands[5][1] == 0x29)
                   and not self.FW_VAR.get('FLASH_DOUBLE_DIE'))
+        if not normal:
+            raise UnsupportedNativeFeature('原版盖中盖编程入口不提供该命令表，不改用自写编程流程')
         with self._lock:
             done = 0
             while done < len(data):
                 if self.CANCEL:
                     raise NativeProtocolError('操作已取消')
                 size = min(4096, len(data) - done)
-                if normal and (not page or page <= 256 * unit) and (not page or (address + done) % page == 0) and (not page or size % page == 0):
-                    part = data[done:done + size]
-                    self._native.write(self.MODE, address + done, part, buffer_size=page)
-                else:
-                    size = unit if not page else min(size, page - ((address + done) % page))
-                    part = data[done:done + size]
-                    self._cart_write_flash(prefixes[:2], flashcart=True)
-                    target = address + done
-                    if page:
-                        self._cart_write(target, self._commands[2][1], flashcart=True)
-                        self._cart_write(target, len(part) // unit - 1, flashcart=True)
-                        self._native.write(self.MODE, target, part)
-                        self._cart_write(target, self._commands[5][1], flashcart=True)
-                    else:
-                        self._cart_write(prefixes[2][0], prefixes[2][1], flashcart=True)
-                        self._native.write(self.MODE, target, part)
-                    deadline = time.monotonic() + 0.5
-                    while self._native.read(self.MODE, target + len(part) - unit, unit) != part[-unit:]:
-                        if time.monotonic() >= deadline:
-                            raise NativeProtocolError('Flash 编程等待超时')
-                if self._native.read(self.MODE, address + done, len(part)) != part:
-                    self.FW_VAR['STATUS_REGISTER'] = 0xffff
-                    self.ERROR_ARGS = {'iteration': done // max(1, max_length)}
-                    return False
+                part = data[done:done + size]
+                # F4/FC 在原版固件内执行编程及完成轮询，上位机只接收 ACK。
+                self._native.write(self.MODE, address + done, part, buffer_size=page)
                 done += len(part)
                 self.FW_VAR['ADDRESS'] = (address + done) // unit
                 self.SetProgress({'action': 'WRITE', 'bytes_added': len(part), 'skipping': False})
@@ -675,6 +776,10 @@ class GbxDevice(_DeviceBase):
 
 
 def plugin_entry():
+    # 替换注册表中的官方后端，不增加第二个候选，也不修改官方模块。
+    for index, module in enumerate(HW_DEVICES):
+        if module.GbxDevice is _GBFlashBase:
+            HW_DEVICES[index] = SimpleNamespace(GbxDevice=GBFlashDevice)
     for backend in (GbxDevice, CarbonateDevice):
         if not any(getattr(module.GbxDevice, 'DEVICE_NAME', None) == backend.DEVICE_NAME for module in HW_DEVICES):
             HW_DEVICES.insert(0, SimpleNamespace(GbxDevice=backend))

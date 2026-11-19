@@ -4,7 +4,6 @@
 #ifdef FLASHGBX_COMPAT
 bit flashgbx_is_active(void);
 void flashgbx_reset(void);
-void flashgbx_identify(uint8_t padded);
 void flashgbx_mark_receive(void);
 bit flashgbx_packet_complete(void);
 bit flashgbx_cancelled(void);

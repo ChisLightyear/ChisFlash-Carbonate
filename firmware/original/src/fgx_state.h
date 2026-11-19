@@ -10,7 +10,7 @@ typedef struct {
     FlashCommand commands[6];
     uint8_t configured;
     uint8_t selected_voltage;
-    uint32_t auto_ticks;
+    uint16_t auto_ticks;
     uint8_t bank_count;
     uint32_t bank_address[3];
     uint8_t bank_mode[3];

@@ -507,17 +507,6 @@ void uart_cmdHandler()
             break;
 
         case 0xf6: // rom 读取透传
-#ifdef FLASHGBX_COMPAT
-            /* 旧设备把这帧作为正常的 62 字节读取；只有本固件解释尾部 CF 标记。
-               普通客户端的零占位或校验尾不变，正常 F6 数据路径不受影响。 */
-            if (received == 11 && cmdBuf[3] == 0 && cmdBuf[4] == 0 &&
-                cmdBuf[5] == 0 && cmdBuf[6] == 0 &&
-                cmdBuf[7] == 62 && cmdBuf[8] == 0 &&
-                cmdBuf[9] == 'C' && cmdBuf[10] == 'F') {
-                flashgbx_identify(1);
-                break;
-            }
-#endif
             romRead();
             break;
 
